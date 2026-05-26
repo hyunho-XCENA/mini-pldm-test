@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define PEER_EID 9
+#define PEER_EID 8
 #define PEER_TID 1
 
 int main(void)

@@ -10,7 +10,7 @@ CFLAGS := -Wall -Wextra -O0 -g \
 LDFLAGS := -L$(LIBPLDM_BUILD)/src -lpldm \
            -Wl,-rpath,$(LIBPLDM_BUILD)/src
 
-BINS := responder requester
+BINS := responder requester daemon_responder
 
 all: check-libpldm $(BINS)
 
@@ -29,6 +29,9 @@ responder: responder.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 requester: requester.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+daemon_responder: daemon_responder.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
