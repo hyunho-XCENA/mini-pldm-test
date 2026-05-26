@@ -4,13 +4,20 @@
 LIBPLDM_SRC ?= ../libpldm
 LIBPLDM_BUILD ?= $(LIBPLDM_SRC)/build
 
+LIBMCTP_SRC ?= ../libmctp
+LIBMCTP_BUILD ?= $(LIBMCTP_SRC)/build-meson
+
 CFLAGS := -Wall -Wextra -O0 -g \
           -I$(LIBPLDM_SRC)/include \
           -I$(LIBPLDM_BUILD)/include
 LDFLAGS := -L$(LIBPLDM_BUILD)/src -lpldm \
            -Wl,-rpath,$(LIBPLDM_BUILD)/src
 
-BINS := responder requester daemon_responder
+MCTP_CFLAGS := -I$(LIBMCTP_SRC) -I$(LIBMCTP_BUILD)
+MCTP_LDFLAGS := -L$(LIBMCTP_BUILD) -lmctp \
+                -Wl,-rpath,$(LIBMCTP_BUILD)
+
+BINS := responder requester daemon_responder mctp_i2c_send
 
 all: check-libpldm $(BINS)
 
@@ -33,6 +40,9 @@ requester: requester.c
 
 daemon_responder: daemon_responder.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+mctp_i2c_send: mctp_i2c_send.c
+	$(CC) $(CFLAGS) $(MCTP_CFLAGS) $< -o $@ $(LDFLAGS) $(MCTP_LDFLAGS)
 
 clean:
 	rm -f $(BINS)
