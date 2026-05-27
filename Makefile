@@ -1,10 +1,16 @@
-# Override on the command line or via the environment:
-#   make LIBPLDM_SRC=/path/to/libpldm
-#   LIBPLDM_SRC=/path/to/libpldm make
-LIBPLDM_SRC ?= ../libpldm
+# libpldm and libmctp are vendored as git submodules (./libpldm, ./libmctp).
+# One-time setup (checkout + install meson + build both libs):
+#   git submodule update --init
+#   ./lib_build.sh
+# Then build the loopback binaries:
+#   make
+#
+# To build against an external checkout instead of the submodule, override:
+#   make LIBPLDM_SRC=/path/to/libpldm LIBMCTP_SRC=/path/to/libmctp
+LIBPLDM_SRC ?= libpldm
 LIBPLDM_BUILD ?= $(LIBPLDM_SRC)/build
 
-LIBMCTP_SRC ?= ../libmctp
+LIBMCTP_SRC ?= libmctp
 LIBMCTP_BUILD ?= $(LIBMCTP_SRC)/build-meson
 
 CFLAGS := -Wall -Wextra -O0 -g \
@@ -17,29 +23,19 @@ MCTP_CFLAGS := -I$(LIBMCTP_SRC) -I$(LIBMCTP_BUILD)
 MCTP_LDFLAGS := -L$(LIBMCTP_BUILD) -lmctp \
                 -Wl,-rpath,$(LIBMCTP_BUILD)
 
-BINS := responder requester daemon_responder mctp_i2c_send mctp_validator
+BINS := mctp_i2c_send mctp_validator
 
-all: check-libpldm $(BINS)
+all: check $(BINS)
 
-check-libpldm:
+# The submodule libraries are built by ./lib_build.sh, not here. Just verify
+# they're present and point at the setup steps otherwise.
+check:
 	@test -f $(LIBPLDM_SRC)/include/libpldm/base.h \
-	    || { echo "error: libpldm headers not found under LIBPLDM_SRC=$(LIBPLDM_SRC)"; \
-	         echo "       set LIBPLDM_SRC to your libpldm source tree, e.g.:"; \
-	         echo "         make LIBPLDM_SRC=/path/to/libpldm"; \
-	         exit 1; }
-	@test -f $(LIBPLDM_BUILD)/src/libpldm.so \
-	    || { echo "error: libpldm.so not found under LIBPLDM_BUILD=$(LIBPLDM_BUILD)/src"; \
-	         echo "       build libpldm first (meson setup build && meson compile -C build)"; \
-	         exit 1; }
-
-responder: responder.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-requester: requester.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-daemon_responder: daemon_responder.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	    || { echo "error: submodules not checked out"; \
+	         echo "       run: git submodule update --init"; exit 1; }
+	@test -f $(LIBPLDM_BUILD)/src/libpldm.so && test -f $(LIBMCTP_BUILD)/libmctp.so \
+	    || { echo "error: submodule libraries not built"; \
+	         echo "       run: ./lib_build.sh"; exit 1; }
 
 mctp_i2c_send: mctp_i2c_send.c
 	$(CC) $(CFLAGS) $(MCTP_CFLAGS) $< -o $@ $(LDFLAGS) $(MCTP_LDFLAGS)
@@ -51,4 +47,4 @@ mctp_validator: mctp_validator.c
 clean:
 	rm -f $(BINS)
 
-.PHONY: all clean check-libpldm
+.PHONY: all check clean
