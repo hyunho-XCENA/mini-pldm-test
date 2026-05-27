@@ -131,13 +131,39 @@ static bool round_trip(struct mctp *mctp, struct mctp_binding_i2c *i2c, int fd,
 		return false;
 	}
 
-	/* Master reads start at [cmd|bytecount|source|...]; prepend our own
-	 * address byte so libmctp's i2c parser sees a full mctp_i2c_hdr. */
+	/* A plain i2c-dev master read clocks out a fixed number of bytes and the
+	 * slave zero-pads the tail. The real frame length comes from the SMBus
+	 * byte count: rxbuf = [cmd|bytecount|source|...], where bytecount counts
+	 * everything after it (source + MCTP payload). So the on-wire frame is
+	 * cmd + bytecount-field + bytecount bytes. Trim to that before parsing,
+	 * otherwise libmctp's "bytecount == len - 3" check rejects the padding. */
+	if (n < 2) {
+		printf("    short read (%zd bytes, no byte-count field)\n", n);
+		return false;
+	}
+	size_t frame_len = 2 + (size_t)rxbuf[1];
+	if (frame_len > (size_t)n) {
+		printf("    byte count %u exceeds %zd bytes read\n", rxbuf[1], n);
+		return false;
+	}
+
+	printf("    [rx] %zu-byte frame:", frame_len);
+	for (size_t i = 0; i < frame_len && i < 24; i++) {
+		printf(" %02x", rxbuf[i]);
+	}
+	printf("%s\n", frame_len > 24 ? " ..." : "");
+
+	/* Prepend our own address byte so libmctp's i2c parser sees a full
+	 * mctp_i2c_hdr (dest first); the dest byte isn't on the wire for reads. */
 	uint8_t framed[1 + sizeof(rxbuf)];
 	framed[0] = OUR_I2C_ADDR << 1;
-	memcpy(framed + 1, rxbuf, n);
-	mctp_i2c_rx(i2c, framed, (size_t)n + 1);
+	memcpy(framed + 1, rxbuf, frame_len);
+	mctp_i2c_rx(i2c, framed, frame_len + 1);
 
+	if (!st->got_response) {
+		printf("    libmctp dropped the %zu-byte frame (bad cmd/bytecount/dest-EID?)\n",
+		       frame_len + 1);
+	}
 	return st->got_response;
 }
 
@@ -193,20 +219,19 @@ static bool check_ctrl_resp(const struct rx_state *st, uint8_t iid, uint8_t tag,
 /* Get Endpoint ID (0x02): no request data; response = [EID][type][medium]. */
 static bool test_get_endpoint_id(struct mctp *mctp,
 				 struct mctp_binding_i2c *i2c, int fd,
-				 uint8_t iid, uint8_t tag)
+				 uint8_t iid, uint8_t tag, struct rx_state *st)
 {
 	uint8_t req[3] = { MCTP_MSG_TYPE_CONTROL,
 			   MCTP_CTRL_RQ_BIT | (iid & MCTP_CTRL_IID_MASK),
 			   CMD_GET_ENDPOINT_ID };
 
-	struct rx_state st;
-	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), &st)) {
+	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), st)) {
 		return false;
 	}
 
 	const uint8_t *d;
 	size_t dlen;
-	if (!check_ctrl_resp(&st, iid, tag, CMD_GET_ENDPOINT_ID, &d, &dlen)) {
+	if (!check_ctrl_resp(st, iid, tag, CMD_GET_ENDPOINT_ID, &d, &dlen)) {
 		return false;
 	}
 	if (dlen < 1) {
@@ -226,21 +251,20 @@ static bool test_get_endpoint_id(struct mctp *mctp,
  * response = [count][count * 4-byte version entries]. */
 static bool test_get_mctp_version(struct mctp *mctp,
 				  struct mctp_binding_i2c *i2c, int fd,
-				  uint8_t iid, uint8_t tag)
+				  uint8_t iid, uint8_t tag, struct rx_state *st)
 {
 	uint8_t req[4] = { MCTP_MSG_TYPE_CONTROL,
 			   MCTP_CTRL_RQ_BIT | (iid & MCTP_CTRL_IID_MASK),
 			   CMD_GET_MCTP_VERSION,
 			   0xff /* base MCTP spec versions */ };
 
-	struct rx_state st;
-	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), &st)) {
+	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), st)) {
 		return false;
 	}
 
 	const uint8_t *d;
 	size_t dlen;
-	if (!check_ctrl_resp(&st, iid, tag, CMD_GET_MCTP_VERSION, &d, &dlen)) {
+	if (!check_ctrl_resp(st, iid, tag, CMD_GET_MCTP_VERSION, &d, &dlen)) {
 		return false;
 	}
 	if (dlen < 1) {
@@ -270,20 +294,20 @@ static bool test_get_mctp_version(struct mctp *mctp,
  * response = [count][count message-type bytes]. Must advertise PLDM. */
 static bool test_get_msg_type_support(struct mctp *mctp,
 				      struct mctp_binding_i2c *i2c, int fd,
-				      uint8_t iid, uint8_t tag)
+				      uint8_t iid, uint8_t tag,
+				      struct rx_state *st)
 {
 	uint8_t req[3] = { MCTP_MSG_TYPE_CONTROL,
 			   MCTP_CTRL_RQ_BIT | (iid & MCTP_CTRL_IID_MASK),
 			   CMD_GET_MSG_TYPE_SUPPORT };
 
-	struct rx_state st;
-	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), &st)) {
+	if (!round_trip(mctp, i2c, fd, tag, req, sizeof(req), st)) {
 		return false;
 	}
 
 	const uint8_t *d;
 	size_t dlen;
-	if (!check_ctrl_resp(&st, iid, tag, CMD_GET_MSG_TYPE_SUPPORT, &d,
+	if (!check_ctrl_resp(st, iid, tag, CMD_GET_MSG_TYPE_SUPPORT, &d,
 			     &dlen)) {
 		return false;
 	}
@@ -315,7 +339,7 @@ static bool test_get_msg_type_support(struct mctp *mctp,
 }
 
 typedef bool (*test_fn)(struct mctp *, struct mctp_binding_i2c *, int,
-			uint8_t iid, uint8_t tag);
+			uint8_t iid, uint8_t tag, struct rx_state *st);
 
 struct test_case {
 	const char *name;
@@ -380,7 +404,7 @@ int main(void)
 		/* MCTP instance IDs are 5-bit; tags are 3-bit. */
 		bool ok = tests[i].fn(mctp, i2c, tctx.fd,
 				      (uint8_t)(i & MCTP_CTRL_IID_MASK),
-				      (uint8_t)(i & 0x7));
+				      (uint8_t)(i & 0x7), &st);
 		printf("%s %s\n", ok ? "[PASS]" : "[FAIL]", tests[i].name);
 		if (!ok) {
 			failures++;

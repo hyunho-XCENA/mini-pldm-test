@@ -153,9 +153,8 @@ int main(void)
 		I2C_DEV, OUR_EID, OUR_I2C_ADDR, PEER_EID, PEER_I2C_ADDR,
 		RESP_SETTLE_MS);
 
-	/* The Zephyr slave responds with "pong" to any MCTP message, so we just
-	 * send a short "ping" rather than a strict PLDM request. */
-	uint8_t msg[] = { MCTP_TYPE_PLDM, 'p', 'i', 'n', 'g', ' ', 'x', 'c', 'e', 'n', 'a', '\0' };
+	/* MCTP Control: Get Endpoint ID — type=0x00, Rq=1, inst=0, cmd=0x02 */
+	uint8_t msg[] = { 0x00, 0x80, 0x02 };
 
 	fprintf(stderr,
 		"[main] sending MCTP \"ping\" (%zu bytes, type=0x%02x)\n",
@@ -182,23 +181,27 @@ int main(void)
 		uint8_t rxbuf[128];
 		ssize_t n = read(tctx.fd, rxbuf, sizeof(rxbuf));
 		if (n < 0) {
-			fprintf(stderr, "read: %s\n", strerror(errno));
-		} else if (n > 0) {
-			fprintf(stderr, "[rx] %zd bytes:", n);
-			for (ssize_t i = 0; i < n && i < 16; i++) {
-				fprintf(stderr, " %02x", rxbuf[i]);
+		    fprintf(stderr, "read: %s\n", strerror(errno));
+		} else if (n >= 2 && rxbuf[0] == 0x0f) {
+		    /* STM32 pads with 0x00; real frame = cmd + bytecount + (source + MCTP). */
+		    size_t used = 2 + rxbuf[1];
+		    if ((size_t)n < used) {
+		        fprintf(stderr, "[rx] short read: got %zd, need %zu\n", n, used);
+		    } else {
+		        fprintf(stderr, "[rx] frame %zu bytes:", used);
+			    for (size_t i = 0; i < used && i < 16; i++) {
+		    		fprintf(stderr, " %02x", rxbuf[i]);
+				}
+				fprintf(stderr, "%s\n", used > 16 ? " ..." : "");
+				/* libmctp wants [dest][cmd][bytecount][source][MCTP...]. Prepend dest. */
+				uint8_t framed[1 + sizeof(rxbuf)];
+				framed[0] = OUR_I2C_ADDR << 1;
+				memcpy(framed + 1, rxbuf, used);
+				mctp_i2c_rx(i2c, framed, 1 + used);
 			}
-			fprintf(stderr, "%s\n", n > 16 ? " ..." : "");
-
-			/* libmctp expects a full mctp_i2c_hdr (dest first). The
-			 * master read returns bytes starting from the slave's
-			 * [cmd|bytecount|source|...] -- the dest byte isn't on the
-			 * wire for reads. Prepend our own address byte so the
-			 * libmctp parser is happy. */
-			uint8_t framed[1 + sizeof(rxbuf)];
-			framed[0] = OUR_I2C_ADDR << 1;
-			memcpy(framed + 1, rxbuf, n);
-			mctp_i2c_rx(i2c, framed, (size_t)n + 1);
+		} else {
+    		fprintf(stderr, "[rx] no staged reply (first byte 0x%02x)\n",
+            	n > 0 ? rxbuf[0] : 0);
 		}
 	}
 
