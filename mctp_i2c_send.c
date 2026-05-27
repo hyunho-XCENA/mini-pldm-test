@@ -155,7 +155,7 @@ int main(void)
 
 	/* The Zephyr slave responds with "pong" to any MCTP message, so we just
 	 * send a short "ping" rather than a strict PLDM request. */
-	uint8_t msg[] = { MCTP_TYPE_PLDM, 'p', 'i', 'n', 'g', '\0' };
+	uint8_t msg[] = { MCTP_TYPE_PLDM, 'p', 'i', 'n', 'g', ' ', 'x', 'c', 'e', 'n', 'a', '\0' };
 
 	fprintf(stderr,
 		"[main] sending MCTP \"ping\" (%zu bytes, type=0x%02x)\n",
