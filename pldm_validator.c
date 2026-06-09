@@ -58,6 +58,12 @@ static const ver32_t PLDM_BASE_VERSION = {
 	.alpha = 0x00, .update = 0xf0, .minor = 0xf1, .major = 0xf1
 };
 
+/* PLDM types the target is required to advertise in GetPLDMTypes. DSP0240
+ * mandates base (0); 2 (Platform Monitoring & Control) and 5 (Firmware Update)
+ * are required by this project's bring-up. GetPLDMTypes FAILs if any is
+ * missing. */
+static const uint8_t REQUIRED_PLDM_TYPES[] = { 0, 2, 5 };
+
 struct tx_ctx {
 	int fd;
 };
@@ -360,22 +366,25 @@ static bool test_get_types(struct mctp *mctp, struct mctp_binding_i2c *i2c,
 		return false;
 	}
 
-	bool has_base = false;
 	printf("    supported PLDM types:");
 	for (int t = 0; t < PLDM_MAX_TYPES; t++) {
 		if (types[t / 8].byte & (1u << (t % 8))) {
 			printf(" %d", t);
-			if (t == PLDM_BASE) {
-				has_base = true;
-			}
 		}
 	}
 	printf("\n");
-	if (!has_base) {
-		printf("    base type (0) not advertised -- required by DSP0240\n");
-		return false;
+
+	/* Every required type must be present. Report all that are missing so a
+	 * single run tells you everything the target still owes. */
+	bool ok = true;
+	for (size_t i = 0; i < sizeof(REQUIRED_PLDM_TYPES); i++) {
+		uint8_t t = REQUIRED_PLDM_TYPES[i];
+		if (!(types[t / 8].byte & (1u << (t % 8)))) {
+			printf("    required type %u not advertised\n", t);
+			ok = false;
+		}
 	}
-	return true;
+	return ok;
 }
 
 /* GetPLDMCommands (0x05): request type + version;
