@@ -33,8 +33,8 @@
 #define I2C_DEV          "/dev/i2c-1"
 #define OUR_I2C_ADDR     0x10
 #define OUR_EID          20      /* matches BUS_OWNER_ID hardcoded in slave app */
-#define PEER_I2C_ADDR    0x46    /* matches Zephyr DT i2c-addr */
-#define PEER_EID         11      /* matches Zephyr DT endpoint-id */
+#define PEER_I2C_ADDR    0x50    /* matches Zephyr DT i2c-addr */
+#define PEER_EID         0x12    /* matches Zephyr DT endpoint-id */
 #define MCTP_TYPE_PLDM   0x01
 #define RESP_SETTLE_MS   100     /* give the slave time to queue "pong" before the single read */
 
