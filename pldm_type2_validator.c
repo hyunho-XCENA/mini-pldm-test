@@ -82,6 +82,9 @@ static int g_state_effecter_id = -1;
 /* The LED: the state effecter whose PDR advertises the Identify state set.
  * Discovered during the walk so neither its id nor its "on" value is hardcoded. */
 static int g_led_effecter_id = -1;
+/* TID advertised by the Terminus Locator PDR, captured during the walk, so the
+ * TID-consistency test can cross-check it against GetTID. -1 = no such PDR. */
+static int g_terminus_tid = -1;
 
 /* Tri-state test result: a read test with no sensor to target is SKIPPED, not
  * failed. */
@@ -531,6 +534,28 @@ static uint16_t rd16(const uint8_t *p)
 	return (uint16_t)(p[0] | (p[1] << 8));
 }
 
+/* Print a Terminus Locator PDR (type 1) and capture its TID for the
+ * TID-consistency cross-check. Field offsets follow struct
+ * pldm_terminus_locator_pdr, counted from the end of the 10-byte common
+ * header: terminus_handle(2), validity(1), tid(1). */
+static void scan_terminus_locator_pdr(const uint8_t *rec, uint16_t cnt)
+{
+	const size_t H = sizeof(struct pldm_pdr_hdr); /* common header = 10 */
+
+	if (cnt < H + 4) {
+		return; /* truncated before the tid byte */
+	}
+	uint16_t terminus_handle = rd16(rec + H);
+	uint8_t validity = rec[H + 2];
+	uint8_t tid = rec[H + 3];
+
+	if (g_terminus_tid < 0) {
+		g_terminus_tid = tid;
+	}
+	printf("        terminus_handle=%u validity=%u tid=%u\n",
+	       terminus_handle, validity, tid);
+}
+
 /* Print the identifying fields of a StateEffecter PDR (type 11) and, while we
  * have them parsed, capture the LED: the effecter whose first composite set uses
  * the Identify state set. Both the effecter_id and the later "on" value thus
@@ -652,6 +677,8 @@ static enum tres test_get_pdr_walk(struct mctp *mctp,
 			note_pdr_ids(hdr.type, rec, resp_cnt);
 			if (hdr.type == PLDM_STATE_EFFECTER_PDR) {
 				scan_state_effecter_pdr(rec, resp_cnt);
+			} else if (hdr.type == PLDM_TERMINUS_LOCATOR_PDR) {
+				scan_terminus_locator_pdr(rec, resp_cnt);
 			}
 		} else {
 			printf("    PDR handle=%u: %u bytes, shorter than a PDR header\n",
@@ -1163,6 +1190,59 @@ static enum tres test_rt_poll_for_event(struct mctp *mctp,
 				PLDM_POLL_FOR_PLATFORM_EVENT_MESSAGE);
 }
 
+/* TID consistency: the slave's TID (GetTID, a PLDM base command) should match
+ * the TID its Terminus Locator PDR advertises. The walk captures the PDR's TID
+ * into g_terminus_tid; here we read the live TID and compare. The slave does not
+ * expose a Terminus Locator PDR yet, so this SKIPs for now -- but it is wired up
+ * so the cross-check runs automatically once that PDR appears. */
+static enum tres test_tid_consistency(struct mctp *mctp,
+				      struct mctp_binding_i2c *i2c, int fd,
+				      uint8_t iid, uint8_t tag,
+				      struct rx_state *st)
+{
+	uint8_t buf[1 + PLDM_HDR_LEN];
+	struct pldm_msg *req;
+	size_t len = frame_pldm_req(buf, &req);
+
+	int rc = encode_get_tid_req(iid, req);
+	if (rc) {
+		printf("    encode_get_tid_req rc=%d\n", rc);
+		return T_FAIL;
+	}
+	if (!round_trip(mctp, i2c, fd, tag, buf, len, st)) {
+		return T_FAIL;
+	}
+	const struct pldm_msg *m;
+	size_t plen;
+	if (!check_pldm_resp(st, iid, tag, PLDM_BASE, PLDM_GET_TID, &m, &plen)) {
+		return T_FAIL;
+	}
+	uint8_t cc, tid;
+	rc = decode_get_tid_resp(m, plen, &cc, &tid);
+	if (rc) {
+		printf("    decode_get_tid_resp rc=%d (payload %zu bytes)\n", rc,
+		       plen);
+		return T_FAIL;
+	}
+	if (cc != PLDM_SUCCESS) {
+		printf("    GetTID completion code 0x%02x (not SUCCESS)\n", cc);
+		return T_FAIL;
+	}
+	printf("    GetTID reports TID=%u\n", tid);
+
+	if (g_terminus_tid < 0) {
+		printf("    no Terminus Locator PDR in the repository -- nothing to cross-check\n");
+		return T_SKIP;
+	}
+	if ((int)tid != g_terminus_tid) {
+		printf("    MISMATCH: Terminus Locator PDR TID=%d != GetTID %u\n",
+		       g_terminus_tid, tid);
+		return T_FAIL;
+	}
+	printf("    matches Terminus Locator PDR TID=%d\n", g_terminus_tid);
+	return T_PASS;
+}
+
 typedef enum tres (*test_fn)(struct mctp *, struct mctp_binding_i2c *, int,
 			     uint8_t iid, uint8_t tag, struct rx_state *st);
 
@@ -1229,6 +1309,7 @@ int main(void)
 		  test_rt_set_sensor_thresholds },
 		{ "PollForPlatformEventMessage (round-trip)",
 		  test_rt_poll_for_event },
+		{ "TID consistency", test_tid_consistency },
 	};
 	size_t ntests = sizeof(tests) / sizeof(tests[0]);
 	int failures = 0, passed = 0, skipped = 0;
