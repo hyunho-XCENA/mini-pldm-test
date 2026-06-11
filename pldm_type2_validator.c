@@ -204,14 +204,14 @@ static bool round_trip(struct mctp *mctp, struct mctp_binding_i2c *i2c, int fd,
 	return st->got_response;
 }
 
-/* Validate the MCTP+PLDM response envelope common to every platform command. On
- * success, hands back the inner pldm_msg and its payload length (bytes after the
- * 3-byte PLDM header) so the caller can run the command-specific libpldm
- * decoder. Identical to pldm_validator.c's check, except the expected PLDM type
- * is PLDM_PLATFORM. */
-static bool check_platform_resp(const struct rx_state *st, uint8_t iid,
-				uint8_t tag, uint8_t cmd,
-				const struct pldm_msg **pmsg, size_t *payload_len)
+/* Validate the MCTP+PLDM response envelope and hand back the inner pldm_msg and
+ * its payload length (bytes after the 3-byte PLDM header) so the caller can run
+ * the command-specific libpldm decoder. expected_type is the PLDM type the
+ * response header must carry -- PLDM_PLATFORM for type-2 commands, PLDM_BASE for
+ * base commands like GetPLDMCommands. */
+static bool check_pldm_resp(const struct rx_state *st, uint8_t iid, uint8_t tag,
+			    uint8_t expected_type, uint8_t cmd,
+			    const struct pldm_msg **pmsg, size_t *payload_len)
 {
 	if (st->src_eid != PEER_EID) {
 		printf("    src EID %u, expected %u\n", st->src_eid, PEER_EID);
@@ -247,9 +247,9 @@ static bool check_platform_resp(const struct rx_state *st, uint8_t iid,
 		       m->hdr.instance_id, iid);
 		return false;
 	}
-	if (m->hdr.type != PLDM_PLATFORM) {
-		printf("    PLDM type %u, expected %u (platform)\n",
-		       m->hdr.type, PLDM_PLATFORM);
+	if (m->hdr.type != expected_type) {
+		printf("    PLDM type %u, expected %u\n", m->hdr.type,
+		       expected_type);
 		return false;
 	}
 	if (m->hdr.command != cmd) {
@@ -263,6 +263,15 @@ static bool check_platform_resp(const struct rx_state *st, uint8_t iid,
 	return true;
 }
 
+/* Convenience wrapper: most tests expect a PLDM_PLATFORM response. */
+static bool check_platform_resp(const struct rx_state *st, uint8_t iid,
+				uint8_t tag, uint8_t cmd,
+				const struct pldm_msg **pmsg, size_t *payload_len)
+{
+	return check_pldm_resp(st, iid, tag, PLDM_PLATFORM, cmd, pmsg,
+			       payload_len);
+}
+
 /* Build the MCTP message for a PLDM request: byte 0 = PLDM message type, then
  * the pldm_msg the libpldm encoder wrote. Returns the base MCTP message length
  * (just the PLDM header); the caller adds payload bytes. The pldm_msg is encoded
@@ -272,6 +281,121 @@ static size_t frame_pldm_req(uint8_t *out, struct pldm_msg **req)
 	out[0] = MCTP_MSG_TYPE_PLDM;
 	*req = (struct pldm_msg *)(out + 1);
 	return 1 + PLDM_HDR_LEN; /* payload bytes added by the caller */
+}
+
+/* Human-readable name for a platform (type 2) command code, or NULL if we don't
+ * have a label for it. Used to annotate the GetPLDMCommands bitmap. */
+static const char *platform_cmd_name(int c)
+{
+	switch (c) {
+	case PLDM_SET_NUMERIC_SENSOR_ENABLE:	   return "SetNumericSensorEnable";
+	case PLDM_GET_SENSOR_READING:		   return "GetSensorReading";
+	case PLDM_GET_SENSOR_THRESHOLDS:	   return "GetSensorThresholds";
+	case PLDM_SET_SENSOR_THRESHOLDS:	   return "SetSensorThresholds";
+	case PLDM_SET_STATE_SENSOR_ENABLES:	   return "SetStateSensorEnables";
+	case PLDM_GET_STATE_SENSOR_READINGS:	   return "GetStateSensorReadings";
+	case PLDM_SET_NUMERIC_EFFECTER_ENABLE:	   return "SetNumericEffecterEnable";
+	case PLDM_SET_NUMERIC_EFFECTER_VALUE:	   return "SetNumericEffecterValue";
+	case PLDM_GET_NUMERIC_EFFECTER_VALUE:	   return "GetNumericEffecterValue";
+	case PLDM_SET_STATE_EFFECTER_STATES:	   return "SetStateEffecterStates";
+	case PLDM_GET_STATE_EFFECTER_STATES:	   return "GetStateEffecterStates";
+	case PLDM_GET_PDR_REPOSITORY_INFO:	   return "GetPDRRepositoryInfo";
+	case PLDM_GET_PDR:			   return "GetPDR";
+	case PLDM_PLATFORM_EVENT_MESSAGE:	   return "PlatformEventMessage";
+	case PLDM_POLL_FOR_PLATFORM_EVENT_MESSAGE: return "PollForPlatformEventMessage";
+	default:				   return NULL;
+	}
+}
+
+/* GetPLDMCommands for the platform type: a PLDM *base* command (0x05) that asks
+ * "which type-2 commands do you implement?". GetPLDMCommands needs the version
+ * of the type being queried, so we first fetch it with GetPLDMVersion(platform).
+ * Both responses are PLDM_BASE-typed. Prints the advertised command bitmap so a
+ * single run shows which of this validator's tests the slave should support. */
+static enum tres test_get_platform_commands(struct mctp *mctp,
+					    struct mctp_binding_i2c *i2c, int fd,
+					    uint8_t iid, uint8_t tag,
+					    struct rx_state *st)
+{
+	/* 1) GetPLDMVersion(type=platform) -> ver32_t */
+	uint8_t vbuf[1 + PLDM_HDR_LEN + PLDM_GET_VERSION_REQ_BYTES];
+	struct pldm_msg *vreq;
+	size_t vlen = frame_pldm_req(vbuf, &vreq) + PLDM_GET_VERSION_REQ_BYTES;
+
+	int rc = encode_get_version_req(iid, /*transfer_handle=*/0,
+					PLDM_GET_FIRSTPART, PLDM_PLATFORM, vreq);
+	if (rc) {
+		printf("    encode_get_version_req rc=%d\n", rc);
+		return T_FAIL;
+	}
+	if (!round_trip(mctp, i2c, fd, tag, vbuf, vlen, st)) {
+		return T_FAIL;
+	}
+	const struct pldm_msg *vm;
+	size_t vplen;
+	if (!check_pldm_resp(st, iid, tag, PLDM_BASE, PLDM_GET_PLDM_VERSION, &vm,
+			     &vplen)) {
+		return T_FAIL;
+	}
+	uint8_t vcc, vflag;
+	uint32_t vnext;
+	ver32_t ver;
+	rc = decode_get_version_resp(vm, vplen, &vcc, &vnext, &vflag, &ver);
+	if (rc) {
+		printf("    decode_get_version_resp rc=%d (payload %zu bytes)\n",
+		       rc, vplen);
+		return T_FAIL;
+	}
+	if (vcc != PLDM_SUCCESS) {
+		printf("    GetPLDMVersion(platform) completion code 0x%02x\n",
+		       vcc);
+		return T_FAIL;
+	}
+	printf("    platform version %02x.%02x.%02x.%02x\n", ver.major,
+	       ver.minor, ver.update, ver.alpha);
+
+	/* 2) GetPLDMCommands(type=platform, ver) -> 32-byte command mask */
+	uint8_t cbuf[1 + PLDM_HDR_LEN + PLDM_GET_COMMANDS_REQ_BYTES];
+	struct pldm_msg *creq;
+	size_t clen = frame_pldm_req(cbuf, &creq) + PLDM_GET_COMMANDS_REQ_BYTES;
+
+	rc = encode_get_commands_req(iid, PLDM_PLATFORM, ver, creq);
+	if (rc) {
+		printf("    encode_get_commands_req rc=%d\n", rc);
+		return T_FAIL;
+	}
+	if (!round_trip(mctp, i2c, fd, tag, cbuf, clen, st)) {
+		return T_FAIL;
+	}
+	const struct pldm_msg *cm;
+	size_t cplen;
+	if (!check_pldm_resp(st, iid, tag, PLDM_BASE, PLDM_GET_PLDM_COMMANDS,
+			     &cm, &cplen)) {
+		return T_FAIL;
+	}
+	uint8_t ccc;
+	bitfield8_t cmds[32];
+	rc = decode_get_commands_resp(cm, cplen, &ccc, cmds);
+	if (rc) {
+		printf("    decode_get_commands_resp rc=%d (payload %zu bytes)\n",
+		       rc, cplen);
+		return T_FAIL;
+	}
+	if (ccc != PLDM_SUCCESS) {
+		printf("    GetPLDMCommands(platform) completion code 0x%02x\n",
+		       ccc);
+		return T_FAIL;
+	}
+
+	printf("    platform commands advertised:\n");
+	for (int c = 0; c < PLDM_MAX_CMDS_PER_TYPE; c++) {
+		if (cmds[c / 8].byte & (1u << (c % 8))) {
+			const char *nm = platform_cmd_name(c);
+			printf("      0x%02x%s%s\n", c, nm ? "  " : "",
+			       nm ? nm : "");
+		}
+	}
+	return T_PASS;
 }
 
 /* GetPDRRepositoryInfo (0x50): no request payload;
@@ -1092,6 +1216,7 @@ int main(void)
 		RESP_SETTLE_MS);
 
 	struct test_case tests[] = {
+		{ "GetPLDMCommands(platform)", test_get_platform_commands },
 		{ "GetPDRRepositoryInfo", test_get_pdr_repo_info },
 		{ "GetPDR (walk)", test_get_pdr_walk },
 		{ "GetSensorReading", test_get_sensor_reading },
