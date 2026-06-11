@@ -23,7 +23,7 @@ MCTP_CFLAGS := -I$(LIBMCTP_SRC) -I$(LIBMCTP_BUILD)
 MCTP_LDFLAGS := -L$(LIBMCTP_BUILD) -lmctp \
                 -Wl,-rpath,$(LIBMCTP_BUILD)
 
-BINS := mctp_i2c_send mctp_validator pldm_validator
+BINS := mctp_i2c_send mctp_validator pldm_validator pldm_type2_validator
 
 all: check $(BINS)
 
@@ -46,6 +46,10 @@ mctp_validator: mctp_validator.c
 
 # PLDM base protocol over MCTP -- needs both libpldm and libmctp.
 pldm_validator: pldm_validator.c
+	$(CC) $(CFLAGS) $(MCTP_CFLAGS) $< -o $@ $(LDFLAGS) $(MCTP_LDFLAGS)
+
+# PLDM Type 2 (platform monitoring & control) over MCTP -- both libs.
+pldm_type2_validator: pldm_type2_validator.c
 	$(CC) $(CFLAGS) $(MCTP_CFLAGS) $< -o $@ $(LDFLAGS) $(MCTP_LDFLAGS)
 
 clean:

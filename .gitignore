@@ -1,3 +1,5 @@
 # Build artifacts (produced by `make`)
 /mctp_i2c_send
 /mctp_validator
+/pldm_validator
+/pldm_type2_validator
