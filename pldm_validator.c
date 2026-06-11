@@ -286,6 +286,128 @@ static bool test_get_tid(struct mctp *mctp, struct mctp_binding_i2c *i2c,
 	return true;
 }
 
+/* GetTID round-trip; on SUCCESS hands back the current TID. */
+static bool tid_get(struct mctp *mctp, struct mctp_binding_i2c *i2c, int fd,
+		    uint8_t iid, uint8_t tag, struct rx_state *st, uint8_t *tid)
+{
+	uint8_t buf[1 + PLDM_HDR_LEN];
+	struct pldm_msg *req;
+	size_t len = frame_pldm_req(buf, &req);
+
+	int rc = encode_get_tid_req(iid, req);
+	if (rc) {
+		printf("    encode_get_tid_req rc=%d\n", rc);
+		return false;
+	}
+	if (!round_trip(mctp, i2c, fd, tag, buf, len, st)) {
+		return false;
+	}
+	const struct pldm_msg *m;
+	size_t plen;
+	if (!check_pldm_resp(st, iid, tag, PLDM_GET_TID, &m, &plen)) {
+		return false;
+	}
+	uint8_t cc;
+	rc = decode_get_tid_resp(m, plen, &cc, tid);
+	if (rc) {
+		printf("    decode_get_tid_resp rc=%d (payload %zu bytes)\n", rc,
+		       plen);
+		return false;
+	}
+	if (cc != PLDM_SUCCESS) {
+		printf("    GetTID completion code 0x%02x (not SUCCESS)\n", cc);
+		return false;
+	}
+	return true;
+}
+
+/* SetTID round-trip; true only on a SUCCESS completion code. The response is
+ * just the completion code, so it is read by hand (no libpldm decoder). */
+static bool tid_set(struct mctp *mctp, struct mctp_binding_i2c *i2c, int fd,
+		    uint8_t iid, uint8_t tag, struct rx_state *st, uint8_t tid)
+{
+	uint8_t buf[1 + PLDM_HDR_LEN + PLDM_SET_TID_REQ_BYTES];
+	struct pldm_msg *req;
+	size_t len = frame_pldm_req(buf, &req) + PLDM_SET_TID_REQ_BYTES;
+
+	int rc = encode_set_tid_req(iid, tid, req);
+	if (rc) {
+		printf("    encode_set_tid_req rc=%d\n", rc);
+		return false;
+	}
+	if (!round_trip(mctp, i2c, fd, tag, buf, len, st)) {
+		return false;
+	}
+	const struct pldm_msg *m;
+	size_t plen;
+	if (!check_pldm_resp(st, iid, tag, PLDM_SET_TID, &m, &plen)) {
+		return false;
+	}
+	if (plen < 1) {
+		printf("    SetTID response carried no completion code\n");
+		return false;
+	}
+	uint8_t cc = m->payload[0];
+	if (cc != PLDM_SUCCESS) {
+		printf("    SetTID completion code 0x%02x (not SUCCESS)\n", cc);
+		return false;
+	}
+	return true;
+}
+
+/* SetTID (0x01): verify the responder actually applies a new TID rather than
+ * merely advertising the command. Read the current TID, set a different (still
+ * valid) one, read it back to confirm the change, then restore the original.
+ * The TID is briefly changed but put back before the test returns. */
+static bool test_set_tid(struct mctp *mctp, struct mctp_binding_i2c *i2c,
+			 int fd, uint8_t iid, uint8_t tag, struct rx_state *st)
+{
+	uint8_t orig;
+	if (!tid_get(mctp, i2c, fd, iid, tag, st, &orig)) {
+		printf("    could not read original TID\n");
+		return false;
+	}
+	/* A different TID still inside the valid 0x01..0xfe range. */
+	uint8_t probe = (orig == 3) ? 4 : 3;
+
+	if (!tid_set(mctp, i2c, fd, iid, tag, st, probe)) {
+		return false;
+	}
+	uint8_t readback;
+	if (!tid_get(mctp, i2c, fd, iid, tag, st, &readback)) {
+		printf("    could not read TID back after set\n");
+		return false;
+	}
+	bool applied = readback == probe;
+	printf("    TID %u -> set %u -> read %u%s\n", orig, probe, readback,
+	       applied ? "" : "  (NOT applied!)");
+
+	/* Restore the original TID -- but only if it was a settable value.
+	 * 0x00 (unassigned) and 0xff (reserved) cannot be written back (libpldm
+	 * rejects them), so when the slave started with one of those we just
+	 * leave the valid probe TID in place. */
+	if (orig >= 0x01 && orig <= 0xfe) {
+		if (tid_set(mctp, i2c, fd, iid, tag, st, orig)) {
+			uint8_t restored;
+			if (tid_get(mctp, i2c, fd, iid, tag, st, &restored) &&
+			    restored == orig) {
+				printf("    restored TID to %u\n", orig);
+			} else {
+				printf("    WARNING: TID may not be restored to %u\n",
+				       orig);
+			}
+		} else {
+			printf("    WARNING: failed to restore TID to %u\n",
+			       orig);
+		}
+	} else {
+		printf("    original TID %u is unassigned/reserved (not settable); leaving TID at %u\n",
+		       orig, probe);
+	}
+
+	return applied;
+}
+
 /* GetPLDMVersion (0x03): request transfer_handle + opflag + type;
  * response = [cc][next_handle][flag][ver32]. */
 static bool test_get_version(struct mctp *mctp, struct mctp_binding_i2c *i2c,
@@ -489,6 +611,7 @@ int main(void)
 
 	struct test_case tests[] = {
 		{ "GetTID", test_get_tid },
+		{ "SetTID", test_set_tid },
 		{ "GetPLDMVersion", test_get_version },
 		{ "GetPLDMTypes", test_get_types },
 		{ "GetPLDMCommands", test_get_commands },
