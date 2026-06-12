@@ -584,6 +584,24 @@ static void scan_terminus_locator_pdr(const uint8_t *rec, uint16_t cnt)
 	       terminus_handle, validity, tid);
 }
 
+/* Name for the common PLDM state set IDs (DSP0249) we're likely to meet, so PDR
+ * dumps read "Presence" rather than a bare "13". "?" = one we don't spell out. */
+static const char *state_set_name(uint16_t id)
+{
+	switch (id) {
+	case PLDM_STATE_SET_HEALTH_STATE:		return "HealthState";
+	case PLDM_STATE_SET_AVAILABILITY:		return "Availability";
+	case PLDM_STATE_SET_OPERATIONAL_STATUS:		return "OperationalStatus";
+	case PLDM_STATE_SET_OPERATIONAL_RUNNING_STATUS: return "OperationalRunningStatus";
+	case PLDM_STATE_SET_OPERATIONAL_FAULT_STATUS:	return "OperationalFaultStatus";
+	case PLDM_STATE_SET_PRESENCE:			return "Presence";
+	case PLDM_STATE_SET_CONFIGURATION_STATE:	return "ConfigurationState";
+	case PLDM_STATE_SET_IDENTIFY_STATE:		return "IdentifyState";
+	case PLDM_STATE_SET_THERMAL_TRIP:		return "ThermalTrip";
+	default:					return "?";
+	}
+}
+
 /* Print the identifying fields of a StateEffecter PDR (type 11) and, while we
  * have them parsed, capture the LED: the effecter whose first composite set uses
  * the Identify state set. Both the effecter_id and the later "on" value thus
@@ -610,15 +628,51 @@ static void scan_state_effecter_pdr(const uint8_t *rec, uint16_t cnt)
 		g_led_effecter_id = effecter_id;
 	}
 
-	printf("        effecter_id=0x%04x entity_type=%u semantic_id=%u comp=%u state_set=%u%s\n",
+	printf("        effecter_id=0x%04x entity_type=%u semantic_id=%u comp=%u state_set=%u (%s)\n",
 	       effecter_id, entity_type, semantic_id, comp_count, state_set_id,
-	       state_set_id == PLDM_STATE_SET_IDENTIFY_STATE ? " (IdentifyState)" :
-								"");
+	       state_set_name(state_set_id));
 
 	if (pss_size > 0 && cnt >= H + 18 + pss_size) {
 		printf("        supported states:");
 		for (uint8_t b = 0; b < pss_size; b++) {
 			uint8_t bits = rec[H + 18 + b];
+			for (int i = 0; i < 8; i++) {
+				if (bits & (1u << i)) {
+					printf(" %d", b * 8 + i);
+				}
+			}
+		}
+		printf("\n");
+	}
+}
+
+/* Print the identifying fields of a StateSensor PDR (type 4): sensor_id,
+ * entity_type, composite count and the first composite's state_set_id (labelled
+ * if it's one we recognise). Offsets follow struct pldm_state_sensor_pdr from
+ * the end of the 10-byte common header. The state sensor has fewer pre-state
+ * fields than the effecter, so its state_set_id sits at H+13, not H+15. */
+static void scan_state_sensor_pdr(const uint8_t *rec, uint16_t cnt)
+{
+	const size_t H = sizeof(struct pldm_pdr_hdr); /* common header = 10 */
+
+	/* Need through composite_sensor_count + first state_set_id + size. */
+	if (cnt < H + 16) {
+		return;
+	}
+	uint16_t sensor_id = rd16(rec + H + 2);
+	uint16_t entity_type = rd16(rec + H + 4);
+	uint8_t comp_count = rec[H + 12];
+	uint16_t state_set_id = rd16(rec + H + 13);
+	uint8_t pss_size = rec[H + 15];
+
+	printf("        sensor_id=0x%04x entity_type=%u comp=%u state_set=%u (%s)\n",
+	       sensor_id, entity_type, comp_count, state_set_id,
+	       state_set_name(state_set_id));
+
+	if (pss_size > 0 && cnt >= H + 16 + pss_size) {
+		printf("        supported states:");
+		for (uint8_t b = 0; b < pss_size; b++) {
+			uint8_t bits = rec[H + 16 + b];
 			for (int i = 0; i < 8; i++) {
 				if (bits & (1u << i)) {
 					printf(" %d", b * 8 + i);
@@ -650,8 +704,8 @@ static const char *pdr_type_name(uint8_t t)
 static const char *sensor_unit_name(int unit)
 {
 	switch (unit) {
-	case PLDM_SENSOR_UNIT_DEGRESS_C: return "degC";
-	case PLDM_SENSOR_UNIT_DEGRESS_F: return "degF";
+	case PLDM_SENSOR_UNIT_DEGRESS_C: return "°C";
+	case PLDM_SENSOR_UNIT_DEGRESS_F: return "°F";
 	case PLDM_SENSOR_UNIT_KELVINS:   return "K";
 	case PLDM_SENSOR_UNIT_VOLTS:     return "V";
 	case PLDM_SENSOR_UNIT_AMPS:      return "A";
@@ -777,6 +831,8 @@ static enum tres test_get_pdr_walk(struct mctp *mctp,
 			note_pdr_ids(hdr.type, rec, resp_cnt);
 			if (hdr.type == PLDM_STATE_EFFECTER_PDR) {
 				scan_state_effecter_pdr(rec, resp_cnt);
+			} else if (hdr.type == PLDM_STATE_SENSOR_PDR) {
+				scan_state_sensor_pdr(rec, resp_cnt);
 			} else if (hdr.type == PLDM_TERMINUS_LOCATOR_PDR) {
 				scan_terminus_locator_pdr(rec, resp_cnt);
 			}
