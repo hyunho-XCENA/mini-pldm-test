@@ -77,6 +77,10 @@
  * the read tests (GetSensorReading, GetStateSensorReadings,
  * GetSensorThresholds, GetStateEffecterStates). -1 means "not found". */
 static int g_numeric_sensor_id = -1;
+/* base_unit (PLDM_SENSOR_UNIT_*) of the numeric sensor above, captured during
+ * the walk so the read test can label its reading (e.g. degC for temperature).
+ * -1 = unknown. */
+static int g_numeric_sensor_unit = -1;
 static int g_state_sensor_id = -1;
 static int g_state_effecter_id = -1;
 /* The LED: the state effecter whose PDR advertises the Identify state set.
@@ -475,6 +479,14 @@ static void note_pdr_ids(uint8_t type, const uint8_t *rec, uint16_t cnt)
 	uint16_t id = (uint16_t)(rec[ID_OFF] | (rec[ID_OFF + 1] << 8));
 	if (numeric && g_numeric_sensor_id < 0) {
 		g_numeric_sensor_id = id;
+		/* base_unit sits past the sensor_id: +10 bytes in the numeric-sensor
+		 * value PDR, +9 in the compact-numeric PDR (one fewer pre-unit
+		 * field). Only read it if the record actually reaches that far. */
+		size_t unit_off = ID_OFF +
+				  (type == PLDM_NUMERIC_SENSOR_PDR ? 10 : 9);
+		if (cnt > unit_off) {
+			g_numeric_sensor_unit = rec[unit_off];
+		}
 	} else if (type == PLDM_STATE_SENSOR_PDR && g_state_sensor_id < 0) {
 		g_state_sensor_id = id;
 	} else if (type == PLDM_STATE_EFFECTER_PDR && g_state_effecter_id < 0) {
@@ -616,6 +628,60 @@ static const char *pdr_type_name(uint8_t t)
 	}
 }
 
+/* Short label for the sensor base_unit values a reading is likely to carry, so
+ * GetSensorReading output is self-describing (e.g. a temperature reads "degC").
+ * NULL = no unit captured or one we don't spell out. */
+static const char *sensor_unit_name(int unit)
+{
+	switch (unit) {
+	case PLDM_SENSOR_UNIT_DEGRESS_C: return "degC";
+	case PLDM_SENSOR_UNIT_DEGRESS_F: return "degF";
+	case PLDM_SENSOR_UNIT_KELVINS:   return "K";
+	case PLDM_SENSOR_UNIT_VOLTS:     return "V";
+	case PLDM_SENSOR_UNIT_AMPS:      return "A";
+	case PLDM_SENSOR_UNIT_WATTS:     return "W";
+	case PLDM_SENSOR_UNIT_RPM:       return "RPM";
+	default:                         return NULL;
+	}
+}
+
+/* Width in bytes of a sensor value of the given PLDM_SENSOR_DATA_SIZE_* tag.
+ * 0 = unrecognised tag. */
+static size_t sensor_value_width(uint8_t ds)
+{
+	switch (ds) {
+	case PLDM_SENSOR_DATA_SIZE_UINT8:
+	case PLDM_SENSOR_DATA_SIZE_SINT8:  return 1;
+	case PLDM_SENSOR_DATA_SIZE_UINT16:
+	case PLDM_SENSOR_DATA_SIZE_SINT16: return 2;
+	case PLDM_SENSOR_DATA_SIZE_UINT32:
+	case PLDM_SENSOR_DATA_SIZE_SINT32: return 4;
+	default:                           return 0;
+	}
+}
+
+/* Read one little-endian sensor value of the given data_size from p, sign-
+ * extending the signed formats, and widen it to int64_t for printing. */
+static int64_t read_sensor_value(const uint8_t *p, uint8_t ds)
+{
+	uint32_t u = (uint32_t)p[0];
+	switch (ds) {
+	case PLDM_SENSOR_DATA_SIZE_UINT8:  return (uint8_t)p[0];
+	case PLDM_SENSOR_DATA_SIZE_SINT8:  return (int8_t)p[0];
+	case PLDM_SENSOR_DATA_SIZE_UINT16: return (uint16_t)(p[0] | (p[1] << 8));
+	case PLDM_SENSOR_DATA_SIZE_SINT16: return (int16_t)(p[0] | (p[1] << 8));
+	case PLDM_SENSOR_DATA_SIZE_UINT32:
+		u |= (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+		     (uint32_t)p[3] << 24;
+		return (uint32_t)u;
+	case PLDM_SENSOR_DATA_SIZE_SINT32:
+		u |= (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+		     (uint32_t)p[3] << 24;
+		return (int32_t)u;
+	default:                           return 0;
+	}
+}
+
 /* GetPDR (0x51): walk the repository from record handle 0, following
  * nextRecordHandle until it returns 0. PASSes if the first GetPDR succeeds; an
  * empty repository (first handle's next == 0 with zero records) still passes. */
@@ -744,11 +810,16 @@ static enum tres test_get_sensor_reading(struct mctp *mctp,
 	}
 
 	uint8_t cc, data_size, op_state, event_enable, present_state;
-	uint8_t previous_state, event_state, present_reading;
+	uint8_t previous_state, event_state;
+	/* present_reading is written by libpldm as 1/2/4 bytes depending on the
+	 * sensor_data_size the target reports; give it 4 bytes so a UINT16/SINT16/
+	 * UINT32/SINT32 reading can't overflow the stack. Temperature sensors
+	 * typically report SINT8/SINT16. */
+	uint32_t present_reading = 0;
 	rc = decode_get_sensor_reading_resp(m, plen, &cc, &data_size, &op_state,
 					    &event_enable, &present_state,
 					    &previous_state, &event_state,
-					    &present_reading);
+					    (uint8_t *)&present_reading);
 	if (rc) {
 		printf("    decode_get_sensor_reading_resp rc=%d (payload %zu bytes)\n",
 		       rc, plen);
@@ -759,8 +830,15 @@ static enum tres test_get_sensor_reading(struct mctp *mctp,
 		return T_FAIL;
 	}
 
-	printf("    sensor %u: op_state=%u present_state=%u reading=%u (data_size=%u)\n",
-	       sensor_id, op_state, present_state, present_reading, data_size);
+	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
+	if (unit) {
+		printf("    sensor %u: op_state=%u present_state=%u reading=%u %s (data_size=%u)\n",
+		       sensor_id, op_state, present_state, present_reading, unit,
+		       data_size);
+	} else {
+		printf("    sensor %u: op_state=%u present_state=%u reading=%u (data_size=%u)\n",
+		       sensor_id, op_state, present_state, present_reading, data_size);
+	}
 	return T_PASS;
 }
 
@@ -1078,9 +1156,10 @@ static enum tres roundtrip_result(const struct rx_state *st, uint8_t iid,
 	return T_PASS;
 }
 
-/* GetSensorThresholds (0x12) reachability check. libpldm has no requester codec,
- * so the 2-byte request (sensorID) is packed by hand. We only confirm a PLDM
- * response returns -- the slave may legitimately answer UNSUPPORTED. */
+/* GetSensorThresholds (0x12). libpldm has no requester codec, so the 2-byte
+ * request (sensorID) is packed by hand and the response is decoded inline. On
+ * SUCCESS the six thresholds (upper/lower x warning/critical/fatal) are printed;
+ * the slave may also legitimately answer UNSUPPORTED, which is still a pass. */
 static enum tres test_rt_get_sensor_thresholds(struct mctp *mctp,
 					       struct mctp_binding_i2c *i2c,
 					       int fd, uint8_t iid, uint8_t tag,
@@ -1112,7 +1191,62 @@ static enum tres test_rt_get_sensor_thresholds(struct mctp *mctp,
 	if (!round_trip(mctp, i2c, fd, tag, reqbuf, msg_len, st)) {
 		return T_FAIL;
 	}
-	return roundtrip_result(st, iid, tag, PLDM_GET_SENSOR_THRESHOLDS);
+
+	const struct pldm_msg *m;
+	size_t plen;
+	if (!check_platform_resp(st, iid, tag, PLDM_GET_SENSOR_THRESHOLDS, &m,
+				 &plen)) {
+		return T_FAIL;
+	}
+	if (plen < 1) {
+		printf("    response carried no completion code byte\n");
+		return T_FAIL;
+	}
+	uint8_t cc = m->payload[0];
+	if (cc != PLDM_SUCCESS) {
+		/* UNSUPPORTED etc. is a legitimate answer -- clean round-trip. */
+		printf("    completion code 0x%02x (not SUCCESS) -- no thresholds\n",
+		       cc);
+		return T_PASS;
+	}
+
+	/* SUCCESS payload: completion_code(1) sensor_data_size(1) then six
+	 * thresholds of that width, in order upper W/C/F then lower W/C/F. */
+	if (plen < 2) {
+		printf("    SUCCESS but response had no sensor_data_size\n");
+		return T_FAIL;
+	}
+	uint8_t ds = m->payload[1];
+	size_t w = sensor_value_width(ds);
+	if (w == 0) {
+		printf("    unrecognised sensor_data_size=%u (plen=%zu)\n", ds,
+		       plen);
+		return T_FAIL;
+	}
+	/* Decode whatever whole thresholds the payload carries so the values are
+	 * visible even when the slave sends the wrong count. */
+	size_t avail = (plen - 2) / w;
+	static const char *names[6] = {
+		"upper warning", "upper critical", "upper fatal",
+		"lower warning", "lower critical", "lower fatal",
+	};
+	const uint8_t *p = &m->payload[2];
+	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
+	printf("    thresholds (data_size=%u, %zu of 6 present):\n", ds, avail);
+	for (size_t i = 0; i < avail && i < 6; i++) {
+		int64_t v = read_sensor_value(p + i * w, ds);
+		printf("      %-14s = %lld%s%s\n", names[i], (long long)v,
+		       unit ? " " : "", unit ? unit : "");
+	}
+	if (avail != 6) {
+		/* DSP0248 GetSensorThresholds always returns all six thresholds
+		 * (upper+lower x warning/critical/fatal) in sensor_data_size width,
+		 * even unsupported ones (as 0). A short payload is non-compliant. */
+		printf("    NON-COMPLIANT: expected 6 thresholds (%zu bytes), got %zu "
+		       "(plen=%zu)\n", 6 * w, avail, plen);
+		return T_FAIL;
+	}
+	return T_PASS;
 }
 
 /* SetSensorThresholds (0x13) reachability check -- packed by hand (no libpldm
