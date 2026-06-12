@@ -81,6 +81,16 @@ static int g_numeric_sensor_id = -1;
  * the walk so the read test can label its reading (e.g. degC for temperature).
  * -1 = unknown. */
 static int g_numeric_sensor_unit = -1;
+/* Every numeric/compact-numeric sensor found in the walk, so GetSensorReading
+ * exercises each one (temperature, voltage, current, ...) instead of only the
+ * first. g_numeric_sensor_id/_unit above mirror entry [0] for the threshold
+ * tests, which target a single sensor. */
+#define MAX_NUMERIC_SENSORS 16
+static struct {
+	uint16_t id;
+	int unit;
+} g_numeric_sensors[MAX_NUMERIC_SENSORS];
+static int g_numeric_sensor_count;
 static int g_state_sensor_id = -1;
 static int g_state_effecter_id = -1;
 /* The LED: the state effecter whose PDR advertises the Identify state set.
@@ -477,15 +487,21 @@ static void note_pdr_ids(uint8_t type, const uint8_t *rec, uint16_t cnt)
 		return; /* record was truncated before the ID */
 	}
 	uint16_t id = (uint16_t)(rec[ID_OFF] | (rec[ID_OFF + 1] << 8));
-	if (numeric && g_numeric_sensor_id < 0) {
-		g_numeric_sensor_id = id;
+	if (numeric) {
 		/* base_unit sits past the sensor_id: +10 bytes in the numeric-sensor
 		 * value PDR, +9 in the compact-numeric PDR (one fewer pre-unit
 		 * field). Only read it if the record actually reaches that far. */
 		size_t unit_off = ID_OFF +
 				  (type == PLDM_NUMERIC_SENSOR_PDR ? 10 : 9);
-		if (cnt > unit_off) {
-			g_numeric_sensor_unit = rec[unit_off];
+		int unit = (cnt > unit_off) ? rec[unit_off] : -1;
+		if (g_numeric_sensor_count < MAX_NUMERIC_SENSORS) {
+			g_numeric_sensors[g_numeric_sensor_count].id = id;
+			g_numeric_sensors[g_numeric_sensor_count].unit = unit;
+			g_numeric_sensor_count++;
+		}
+		if (g_numeric_sensor_id < 0) {
+			g_numeric_sensor_id = id;
+			g_numeric_sensor_unit = unit;
 		}
 	} else if (type == PLDM_STATE_SENSOR_PDR && g_state_sensor_id < 0) {
 		g_state_sensor_id = id;
@@ -682,6 +698,24 @@ static int64_t read_sensor_value(const uint8_t *p, uint8_t ds)
 	}
 }
 
+/* Write v as a little-endian sensor value of the given data_size into p
+ * (1/2/4 bytes) -- the inverse of read_sensor_value. Caller guarantees room. */
+static void write_sensor_value(uint8_t *p, uint8_t ds, int64_t v)
+{
+	switch (sensor_value_width(ds)) {
+	case 4:
+		p[2] = (uint8_t)(v >> 16);
+		p[3] = (uint8_t)(v >> 24);
+		/* fall through */
+	case 2:
+		p[1] = (uint8_t)(v >> 8);
+		/* fall through */
+	case 1:
+		p[0] = (uint8_t)v;
+		break;
+	}
+}
+
 /* GetPDR (0x51): walk the repository from record handle 0, following
  * nextRecordHandle until it returns 0. PASSes if the first GetPDR succeeds; an
  * empty repository (first handle's next == 0 with zero records) still passes. */
@@ -776,17 +810,14 @@ static enum tres test_get_pdr_walk(struct mctp *mctp,
 }
 
 /* GetSensorReading (0x11) on the numeric sensor discovered during the walk. */
-static enum tres test_get_sensor_reading(struct mctp *mctp,
+/* GetSensorReading (0x11) on one numeric sensor: encode, round-trip, decode and
+ * print the reading labelled with its base_unit (e.g. degC/V/A). */
+static enum tres read_one_numeric_sensor(struct mctp *mctp,
 					 struct mctp_binding_i2c *i2c, int fd,
 					 uint8_t iid, uint8_t tag,
-					 struct rx_state *st)
+					 struct rx_state *st, uint16_t sensor_id,
+					 int sensor_unit)
 {
-	if (g_numeric_sensor_id < 0) {
-		printf("    no numeric sensor PDR found in the walk -- nothing to read\n");
-		return T_SKIP;
-	}
-	uint16_t sensor_id = (uint16_t)g_numeric_sensor_id;
-
 	uint8_t reqbuf[1 + PLDM_HDR_LEN + PLDM_GET_SENSOR_READING_REQ_BYTES];
 	struct pldm_msg *req;
 	size_t msg_len = frame_pldm_req(reqbuf, &req) +
@@ -826,11 +857,12 @@ static enum tres test_get_sensor_reading(struct mctp *mctp,
 		return T_FAIL;
 	}
 	if (cc != PLDM_SUCCESS) {
-		printf("    completion code 0x%02x (not SUCCESS)\n", cc);
+		printf("    sensor %u: completion code 0x%02x (not SUCCESS)\n",
+		       sensor_id, cc);
 		return T_FAIL;
 	}
 
-	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
+	const char *unit = sensor_unit_name(sensor_unit);
 	if (unit) {
 		printf("    sensor %u: op_state=%u present_state=%u reading=%u %s (data_size=%u)\n",
 		       sensor_id, op_state, present_state, present_reading, unit,
@@ -840,6 +872,30 @@ static enum tres test_get_sensor_reading(struct mctp *mctp,
 		       sensor_id, op_state, present_state, present_reading, data_size);
 	}
 	return T_PASS;
+}
+
+/* GetSensorReading across every numeric sensor found in the walk so the
+ * temperature, voltage and current sensors are all exercised. The test fails if
+ * any one sensor fails; an empty repository skips. */
+static enum tres test_get_sensor_reading(struct mctp *mctp,
+					 struct mctp_binding_i2c *i2c, int fd,
+					 uint8_t iid, uint8_t tag,
+					 struct rx_state *st)
+{
+	if (g_numeric_sensor_count == 0) {
+		printf("    no numeric sensor PDR found in the walk -- nothing to read\n");
+		return T_SKIP;
+	}
+	enum tres worst = T_PASS;
+	for (int i = 0; i < g_numeric_sensor_count; i++) {
+		enum tres r = read_one_numeric_sensor(mctp, i2c, fd, iid, tag, st,
+						      g_numeric_sensors[i].id,
+						      g_numeric_sensors[i].unit);
+		if (r == T_FAIL) {
+			worst = T_FAIL;
+		}
+	}
+	return worst;
 }
 
 /* GetStateSensorReadings (0x21) on the state sensor discovered during the walk. */
@@ -1156,21 +1212,26 @@ static enum tres roundtrip_result(const struct rx_state *st, uint8_t iid,
 	return T_PASS;
 }
 
-/* GetSensorThresholds (0x12). libpldm has no requester codec, so the 2-byte
- * request (sensorID) is packed by hand and the response is decoded inline. On
- * SUCCESS the six thresholds (upper/lower x warning/critical/fatal) are printed;
- * the slave may also legitimately answer UNSUPPORTED, which is still a pass. */
-static enum tres test_rt_get_sensor_thresholds(struct mctp *mctp,
-					       struct mctp_binding_i2c *i2c,
-					       int fd, uint8_t iid, uint8_t tag,
-					       struct rx_state *st)
-{
-	if (g_numeric_sensor_id < 0) {
-		printf("    no numeric sensor found in the walk -- nothing to query\n");
-		return T_SKIP;
-	}
-	uint16_t sensor_id = (uint16_t)g_numeric_sensor_id;
+/* Outcome of a GetSensorThresholds round-trip used by both the get and set
+ * tests. THR_OK = SUCCESS with the threshold body captured; THR_UNSUPPORTED =
+ * clean round-trip but a non-SUCCESS completion code (e.g. UNSUPPORTED);
+ * THR_FAIL = transport/protocol error. */
+enum thr_status { THR_OK, THR_UNSUPPORTED, THR_FAIL };
 
+static const char *const g_threshold_names[6] = {
+	"upper warning", "upper critical", "upper fatal",
+	"lower warning", "lower critical", "lower fatal",
+};
+
+/* GetSensorThresholds(sensor_id). On THR_OK, *ds holds the sensor_data_size and
+ * raw[] the threshold bytes; *navail is how many whole thresholds were present
+ * (DSP0248 mandates 6) and raw is zero-filled out to six slots so callers always
+ * have a full set. *cc carries the completion code. raw must hold 6*4 bytes. */
+static enum thr_status fetch_sensor_thresholds(struct mctp *mctp,
+		struct mctp_binding_i2c *i2c, int fd, uint8_t iid, uint8_t tag,
+		struct rx_state *st, uint16_t sensor_id, uint8_t *cc,
+		uint8_t *ds, uint8_t *raw, size_t *navail)
+{
 	uint8_t reqbuf[1 + PLDM_HDR_LEN + 2];
 	struct pldm_msg *req;
 	size_t msg_len = frame_pldm_req(reqbuf, &req) + 2;
@@ -1183,78 +1244,115 @@ static enum tres test_rt_get_sensor_thresholds(struct mctp *mctp,
 	};
 	if (pack_pldm_header(&hi, &req->hdr)) {
 		printf("    pack_pldm_header failed\n");
-		return T_FAIL;
+		return THR_FAIL;
 	}
 	req->payload[0] = (uint8_t)(sensor_id & 0xff);
 	req->payload[1] = (uint8_t)(sensor_id >> 8);
 
 	if (!round_trip(mctp, i2c, fd, tag, reqbuf, msg_len, st)) {
-		return T_FAIL;
+		return THR_FAIL;
 	}
 
 	const struct pldm_msg *m;
 	size_t plen;
 	if (!check_platform_resp(st, iid, tag, PLDM_GET_SENSOR_THRESHOLDS, &m,
 				 &plen)) {
-		return T_FAIL;
+		return THR_FAIL;
 	}
 	if (plen < 1) {
 		printf("    response carried no completion code byte\n");
-		return T_FAIL;
+		return THR_FAIL;
 	}
-	uint8_t cc = m->payload[0];
-	if (cc != PLDM_SUCCESS) {
-		/* UNSUPPORTED etc. is a legitimate answer -- clean round-trip. */
-		printf("    completion code 0x%02x (not SUCCESS) -- no thresholds\n",
-		       cc);
-		return T_PASS;
+	*cc = m->payload[0];
+	if (*cc != PLDM_SUCCESS) {
+		return THR_UNSUPPORTED;
 	}
-
 	/* SUCCESS payload: completion_code(1) sensor_data_size(1) then six
 	 * thresholds of that width, in order upper W/C/F then lower W/C/F. */
 	if (plen < 2) {
 		printf("    SUCCESS but response had no sensor_data_size\n");
-		return T_FAIL;
+		return THR_FAIL;
 	}
-	uint8_t ds = m->payload[1];
-	size_t w = sensor_value_width(ds);
+	*ds = m->payload[1];
+	size_t w = sensor_value_width(*ds);
 	if (w == 0) {
-		printf("    unrecognised sensor_data_size=%u (plen=%zu)\n", ds,
+		printf("    unrecognised sensor_data_size=%u (plen=%zu)\n", *ds,
 		       plen);
-		return T_FAIL;
+		return THR_FAIL;
 	}
-	/* Decode whatever whole thresholds the payload carries so the values are
-	 * visible even when the slave sends the wrong count. */
 	size_t avail = (plen - 2) / w;
-	static const char *names[6] = {
-		"upper warning", "upper critical", "upper fatal",
-		"lower warning", "lower critical", "lower fatal",
-	};
-	const uint8_t *p = &m->payload[2];
-	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
-	printf("    thresholds (data_size=%u, %zu of 6 present):\n", ds, avail);
-	for (size_t i = 0; i < avail && i < 6; i++) {
-		int64_t v = read_sensor_value(p + i * w, ds);
-		printf("      %-14s = %lld%s%s\n", names[i], (long long)v,
-		       unit ? " " : "", unit ? unit : "");
-	}
-	if (avail != 6) {
-		/* DSP0248 GetSensorThresholds always returns all six thresholds
-		 * (upper+lower x warning/critical/fatal) in sensor_data_size width,
-		 * even unsupported ones (as 0). A short payload is non-compliant. */
-		printf("    NON-COMPLIANT: expected 6 thresholds (%zu bytes), got %zu "
-		       "(plen=%zu)\n", 6 * w, avail, plen);
-		return T_FAIL;
-	}
-	return T_PASS;
+	*navail = avail;
+	size_t got = (avail < 6 ? avail : 6) * w;
+	memcpy(raw, &m->payload[2], got);
+	memset(raw + got, 0, 6 * w - got); /* well-defined slots if short */
+	return THR_OK;
 }
 
-/* SetSensorThresholds (0x13) reachability check -- packed by hand (no libpldm
- * requester codec). NOTE: this is a state-MUTATING command. If the slave ever
- * implements it, this request would overwrite the sensor's six thresholds with
- * zero. It is safe here only as long as the slave answers UNSUPPORTED; the test
- * prints a warning to keep that explicit. */
-static enum tres test_rt_set_sensor_thresholds(struct mctp *mctp,
+/* Print the six thresholds in raw[] (sensor_data_size ds), labelled with the
+ * sensor unit. navail is how many the slave actually sent. */
+static void print_thresholds(const char *title, uint8_t ds, const uint8_t *raw,
+			     size_t navail)
+{
+	size_t w = sensor_value_width(ds);
+	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
+	printf("    %s (data_size=%u, %zu of 6 present):\n", title, ds, navail);
+	for (size_t i = 0; i < navail && i < 6; i++) {
+		int64_t v = read_sensor_value(raw + i * w, ds);
+		printf("      %-14s = %lld%s%s\n", g_threshold_names[i],
+		       (long long)v, unit ? " " : "", unit ? unit : "");
+	}
+}
+
+/* SetSensorThresholds(sensor_id): send the six thresholds in raw[] (width ds).
+ * Returns the completion code, or -1 on a transport/protocol failure. */
+static int send_set_sensor_thresholds(struct mctp *mctp,
+				      struct mctp_binding_i2c *i2c, int fd,
+				      uint8_t iid, uint8_t tag,
+				      struct rx_state *st, uint16_t sensor_id,
+				      uint8_t ds, const uint8_t *raw)
+{
+	size_t w = sensor_value_width(ds);
+	size_t nbytes = 3 + 6 * w; /* sensorID(2) + sensorDataSize(1) + 6*width */
+
+	uint8_t reqbuf[1 + PLDM_HDR_LEN + 3 + 6 * 4];
+	struct pldm_msg *req;
+	size_t msg_len = frame_pldm_req(reqbuf, &req) + nbytes;
+
+	struct pldm_header_info hi = {
+		.msg_type = PLDM_REQUEST,
+		.instance = iid,
+		.pldm_type = PLDM_PLATFORM,
+		.command = PLDM_SET_SENSOR_THRESHOLDS,
+	};
+	if (pack_pldm_header(&hi, &req->hdr)) {
+		printf("    pack_pldm_header failed\n");
+		return -1;
+	}
+	req->payload[0] = (uint8_t)(sensor_id & 0xff);
+	req->payload[1] = (uint8_t)(sensor_id >> 8);
+	req->payload[2] = ds;
+	memcpy(&req->payload[3], raw, 6 * w);
+
+	if (!round_trip(mctp, i2c, fd, tag, reqbuf, msg_len, st)) {
+		return -1;
+	}
+	const struct pldm_msg *m;
+	size_t plen;
+	if (!check_platform_resp(st, iid, tag, PLDM_SET_SENSOR_THRESHOLDS, &m,
+				 &plen)) {
+		return -1;
+	}
+	if (plen < 1) {
+		printf("    SetSensorThresholds response had no completion code\n");
+		return -1;
+	}
+	return m->payload[0];
+}
+
+/* GetSensorThresholds (0x12): reads and prints all six thresholds (upper/lower x
+ * warning/critical/fatal). UNSUPPORTED is a legitimate answer (still a pass); a
+ * short payload prints what it can and is flagged non-compliant per DSP0248. */
+static enum tres test_rt_get_sensor_thresholds(struct mctp *mctp,
 					       struct mctp_binding_i2c *i2c,
 					       int fd, uint8_t iid, uint8_t tag,
 					       struct rx_state *st)
@@ -1265,31 +1363,132 @@ static enum tres test_rt_set_sensor_thresholds(struct mctp *mctp,
 	}
 	uint16_t sensor_id = (uint16_t)g_numeric_sensor_id;
 
-	/* sensorID(2) + sensorDataSize(1) + 6 uint8 thresholds(6) = 9 bytes. */
-	uint8_t reqbuf[1 + PLDM_HDR_LEN + 9];
-	struct pldm_msg *req;
-	size_t msg_len = frame_pldm_req(reqbuf, &req) + 9;
-
-	struct pldm_header_info hi = {
-		.msg_type = PLDM_REQUEST,
-		.instance = iid,
-		.pldm_type = PLDM_PLATFORM,
-		.command = PLDM_SET_SENSOR_THRESHOLDS,
-	};
-	if (pack_pldm_header(&hi, &req->hdr)) {
-		printf("    pack_pldm_header failed\n");
+	uint8_t cc, ds, raw[6 * 4];
+	size_t navail = 0;
+	enum thr_status s = fetch_sensor_thresholds(mctp, i2c, fd, iid, tag, st,
+						    sensor_id, &cc, &ds, raw,
+						    &navail);
+	if (s == THR_FAIL) {
 		return T_FAIL;
 	}
-	req->payload[0] = (uint8_t)(sensor_id & 0xff);
-	req->payload[1] = (uint8_t)(sensor_id >> 8);
-	req->payload[2] = PLDM_SENSOR_DATA_SIZE_UINT8;
-	memset(&req->payload[3], 0, 6); /* six thresholds, all zero */
+	if (s == THR_UNSUPPORTED) {
+		printf("    completion code 0x%02x (not SUCCESS) -- no thresholds\n",
+		       cc);
+		return T_PASS;
+	}
 
-	printf("    NOTE: mutating command; safe only while slave reports UNSUPPORTED\n");
-	if (!round_trip(mctp, i2c, fd, tag, reqbuf, msg_len, st)) {
+	print_thresholds("thresholds", ds, raw, navail);
+	if (navail != 6) {
+		/* DSP0248 GetSensorThresholds always returns all six thresholds,
+		 * even unsupported ones (as 0). A short payload is non-compliant. */
+		printf("    NON-COMPLIANT: expected 6 thresholds, got %zu\n",
+		       navail);
 		return T_FAIL;
 	}
-	return roundtrip_result(st, iid, tag, PLDM_SET_SENSOR_THRESHOLDS);
+	return T_PASS;
+}
+
+/* SetSensorThresholds (0x13). State-mutating, so rather than blindly writing
+ * zeros this reads the current thresholds, nudges the upper-warning by one unit,
+ * writes them back, confirms the change took, then restores the originals --
+ * the same get/set/verify/restore pattern as the LED effecter test. If the slave
+ * answers UNSUPPORTED to either Get or Set, nothing is mutated and the test still
+ * passes (the command is simply not implemented yet). */
+static enum tres test_rt_set_sensor_thresholds(struct mctp *mctp,
+					       struct mctp_binding_i2c *i2c,
+					       int fd, uint8_t iid, uint8_t tag,
+					       struct rx_state *st)
+{
+	if (g_numeric_sensor_id < 0) {
+		printf("    no numeric sensor found in the walk -- nothing to set\n");
+		return T_SKIP;
+	}
+	uint16_t sensor_id = (uint16_t)g_numeric_sensor_id;
+
+	/* 1. Read the current thresholds so we can write meaningful values and
+	 *    restore them afterwards. Without them, mutating would be unsafe. */
+	uint8_t cc, ds, orig[6 * 4];
+	size_t navail = 0;
+	enum thr_status s = fetch_sensor_thresholds(mctp, i2c, fd, iid, tag, st,
+						    sensor_id, &cc, &ds, orig,
+						    &navail);
+	if (s == THR_FAIL) {
+		return T_FAIL;
+	}
+	if (s == THR_UNSUPPORTED) {
+		printf("    GetSensorThresholds unsupported (cc 0x%02x) -- can't read "
+		       "current values to safely set/restore\n", cc);
+		return T_SKIP;
+	}
+	if (navail != 6) {
+		printf("    Get returned %zu of 6 thresholds -- skipping mutate to "
+		       "avoid corrupting the set\n", navail);
+		return T_SKIP;
+	}
+	size_t w = sensor_value_width(ds);
+	const char *unit = sensor_unit_name(g_numeric_sensor_unit);
+	const char *us = unit ? unit : "";
+	const char *usp = unit ? " " : "";
+
+	print_thresholds("current", ds, orig, navail);
+
+	/* 2. Build the modified set: nudge upper-warning by +1, staying below
+	 *    upper-critical so the ordering the slave may validate stays sane. */
+	int64_t uw = read_sensor_value(orig + 0 * w, ds);
+	int64_t uc = read_sensor_value(orig + 1 * w, ds);
+	int64_t new_uw = (uw + 1 < uc) ? uw + 1 : uw - 1;
+	uint8_t mod[6 * 4];
+	memcpy(mod, orig, 6 * w);
+	write_sensor_value(mod + 0 * w, ds, new_uw);
+	printf("    setting upper warning %lld%s%s -> %lld%s%s\n", (long long)uw,
+	       usp, us, (long long)new_uw, usp, us);
+
+	/* 3. Write the modified thresholds. */
+	int sc = send_set_sensor_thresholds(mctp, i2c, fd, iid, tag, st,
+					    sensor_id, ds, mod);
+	if (sc < 0) {
+		return T_FAIL;
+	}
+	if (sc != PLDM_SUCCESS) {
+		/* Not implemented / refused: no mutation happened, clean round-trip. */
+		printf("    SetSensorThresholds completion code 0x%02x (not SUCCESS) "
+		       "-- no mutation\n", sc);
+		return T_PASS;
+	}
+
+	/* 4. Confirm the write took effect. */
+	uint8_t cc2, ds2, after[6 * 4];
+	size_t na2 = 0;
+	enum thr_status s2 = fetch_sensor_thresholds(mctp, i2c, fd, iid, tag, st,
+						     sensor_id, &cc2, &ds2,
+						     after, &na2);
+	bool applied = (s2 == THR_OK && na2 == 6 &&
+			read_sensor_value(after + 0 * w, ds2) == new_uw);
+	printf("    %s: upper warning read back as %lld%s%s\n",
+	       applied ? "verified" : "MISMATCH",
+	       (long long)(s2 == THR_OK ? read_sensor_value(after + 0 * w, ds2)
+					 : 0),
+	       usp, us);
+
+	/* 5. Restore the originals regardless, and confirm. */
+	int rc = send_set_sensor_thresholds(mctp, i2c, fd, iid, tag, st,
+					    sensor_id, ds, orig);
+	bool restored = false;
+	if (rc == PLDM_SUCCESS) {
+		uint8_t cc3, ds3, back[6 * 4];
+		size_t na3 = 0;
+		enum thr_status s3 = fetch_sensor_thresholds(mctp, i2c, fd, iid,
+							     tag, st, sensor_id,
+							     &cc3, &ds3, back,
+							     &na3);
+		restored = (s3 == THR_OK && na3 == 6 &&
+			    read_sensor_value(back + 0 * w, ds3) == uw);
+	}
+	printf("    %s original upper warning %lld%s%s\n",
+	       restored ? "restored" : "WARNING: could not confirm restore of",
+	       (long long)uw, usp, us);
+
+	return (applied && restored) ? T_PASS : T_FAIL;
 }
 
 /* PollForPlatformEventMessage (0x0b) reachability check (BMC->terminus, the
@@ -1437,9 +1636,8 @@ int main(void)
 		{ "GetStateSensorReadings", test_get_state_sensor_readings },
 		{ "GetStateEffecterStates", test_get_state_effecter_states },
 		{ "SetStateEffecterStates (LED)", test_set_state_effecter_states },
-		{ "GetSensorThresholds (round-trip)",
-		  test_rt_get_sensor_thresholds },
-		{ "SetSensorThresholds (round-trip)",
+		{ "GetSensorThresholds", test_rt_get_sensor_thresholds },
+		{ "SetSensorThresholds (set/verify/restore)",
 		  test_rt_set_sensor_thresholds },
 		{ "PollForPlatformEventMessage (round-trip)",
 		  test_rt_poll_for_event },
